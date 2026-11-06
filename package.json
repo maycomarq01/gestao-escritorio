@@ -1,0 +1,13 @@
+{
+  "name": "gestao-escritorio",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gestão de atividades, prazos e documentos do escritório",
+  "main": "server.js",
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning server.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}

@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: gestao-escritorio
+    runtime: node
+    plan: starter
+    region: virginia
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 22.20.0
+      - key: DATA_DIR
+        value: /var/data
+    disk:
+      name: dados
+      mountPath: /var/data
+      sizeGB: 1
