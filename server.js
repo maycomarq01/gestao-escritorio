@@ -3,26 +3,33 @@ const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
-const { DatabaseSync } = require('node:sqlite');
+const { pathToFileURL } = require('node:url');
+const { createClient } = require('@libsql/client');
 
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const TIME_ZONE = 'America/Sao_Paulo';
 const SESSION_DAYS = 30;
 const CLIENT_TYPES = ['obra', 'projeto', 'regularizacao', 'contabil_juridico'];
 
-fs.mkdirSync(DATA_DIR, { recursive: true });
-const db = new DatabaseSync(path.join(DATA_DIR, 'escritorio.db'));
-db.exec(`
-  PRAGMA journal_mode = WAL;
-  PRAGMA foreign_keys = ON;
+function localDatabaseUrl() {
+  const dir = process.env.DATA_DIR || path.join(__dirname, 'data');
+  fs.mkdirSync(dir, { recursive: true });
+  return pathToFileURL(path.join(dir, 'escritorio.db')).href;
+}
+
+// Online os dados ficam no Turso; sem DATABASE_URL, em um arquivo local.
+const db = createClient({
+  url: process.env.DATABASE_URL || localDatabaseUrl(),
+  authToken: process.env.DATABASE_TOKEN || undefined,
+});
+
+const SCHEMA = `
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, login TEXT NOT NULL UNIQUE COLLATE NOCASE,
     password TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'membro'
   );
   CREATE TABLE IF NOT EXISTS sessions (
-    token TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at INTEGER NOT NULL
+    token TEXT PRIMARY KEY, user_id INTEGER NOT NULL, expires_at INTEGER NOT NULL
   );
   CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY, name TEXT NOT NULL, type TEXT NOT NULL, phone TEXT DEFAULT '',
@@ -30,14 +37,13 @@ db.exec(`
     active INTEGER NOT NULL DEFAULT 1
   );
   CREATE TABLE IF NOT EXISTS items (
-    id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
+    id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL,
     kind TEXT NOT NULL, title TEXT NOT NULL, details TEXT DEFAULT '', due_date TEXT,
-    notify_days INTEGER NOT NULL DEFAULT 3, owner_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+    notify_days INTEGER NOT NULL DEFAULT 3, owner_id INTEGER,
     done INTEGER NOT NULL DEFAULT 0, done_at TEXT, visible_to_client INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS seen (
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL, item_id INTEGER NOT NULL,
     due_date TEXT NOT NULL, PRIMARY KEY (user_id, item_id, due_date)
   );
   CREATE TABLE IF NOT EXISTS meetings (
@@ -45,15 +51,23 @@ db.exec(`
     next_date TEXT, closed INTEGER NOT NULL DEFAULT 0
   );
   CREATE TABLE IF NOT EXISTS client_notes (
-    id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL REFERENCES clients(id) ON DELETE CASCADE,
-    meeting_id INTEGER REFERENCES meetings(id) ON DELETE SET NULL,
+    id INTEGER PRIMARY KEY, client_id INTEGER NOT NULL, meeting_id INTEGER,
     author TEXT NOT NULL, text TEXT NOT NULL, date TEXT NOT NULL
   );
   CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
   INSERT OR IGNORE INTO settings (key, value) VALUES ('review_weekday', '1');
-`);
+`;
 
-const q = (sql) => db.prepare(sql);
+async function execute(sql, args) {
+  const result = await db.execute({ sql, args });
+  const rows = result.rows.map((row) => Object.fromEntries(result.columns.map((column) => [column, row[column]])));
+  return { rows, lastId: result.lastInsertRowid === undefined ? null : Number(result.lastInsertRowid) };
+}
+const q = (sql) => ({
+  get: async (...args) => (await execute(sql, args)).rows[0],
+  all: async (...args) => (await execute(sql, args)).rows,
+  run: async (...args) => ({ lastId: (await execute(sql, args)).lastId }),
+});
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -94,8 +108,8 @@ function validPassword(value) {
   if (password.length < 8) throw new HttpError(400, 'A senha precisa ter pelo menos 8 caracteres.');
   return password;
 }
-function find(table, id) {
-  const row = q(`SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
+async function find(table, id) {
+  const row = await q(`SELECT * FROM ${table} WHERE id = ?`).get(Number(id));
   if (!row) throw new HttpError(404, 'Registro não encontrado.');
   return row;
 }
@@ -107,17 +121,17 @@ function parseCookies(req) {
     return [part.slice(0, index).trim(), part.slice(index + 1).trim()];
   }));
 }
-function currentUser(req) {
+async function currentUser(req) {
   const token = parseCookies(req).sid;
   if (!token) return null;
-  return q(`SELECT u.id, u.name, u.login, u.role FROM sessions s JOIN users u ON u.id = s.user_id
-            WHERE s.token = ? AND s.expires_at > ?`).get(sha256(token), Date.now()) || null;
+  return (await q(`SELECT u.id, u.name, u.login, u.role FROM sessions s JOIN users u ON u.id = s.user_id
+                   WHERE s.token = ? AND s.expires_at > ?`).get(sha256(token), Date.now())) || null;
 }
-function startSession(req, res, userId) {
+async function startSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex');
   const maxAge = SESSION_DAYS * 86400;
-  q('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
-  q('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
+  await q('DELETE FROM sessions WHERE expires_at <= ?').run(Date.now());
+  await q('INSERT INTO sessions (token, user_id, expires_at) VALUES (?, ?, ?)')
     .run(sha256(token), userId, Date.now() + maxAge * 1000);
   const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
   res.setHeader('Set-Cookie', `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAge}${secure}`);
@@ -145,37 +159,38 @@ function alertLevel(item) {
   return days <= item.notify_days ? 'proximo' : null;
 }
 
-function bootstrap(me) {
-  const clients = q('SELECT * FROM clients ORDER BY name COLLATE NOCASE').all();
-  const seen = new Set(q('SELECT item_id, due_date FROM seen WHERE user_id = ?').all(me.id)
-    .map((row) => `${row.item_id}|${row.due_date}`));
-  const items = q('SELECT * FROM items ORDER BY done, due_date IS NULL, due_date').all().map((item) => ({
+async function bootstrap(me) {
+  const [clients, seenRows, itemRows, users, notes, meetings, weekday] = await Promise.all([
+    q('SELECT * FROM clients ORDER BY name COLLATE NOCASE').all(),
+    q('SELECT item_id, due_date FROM seen WHERE user_id = ?').all(me.id),
+    q('SELECT * FROM items ORDER BY done, due_date IS NULL, due_date').all(),
+    q('SELECT id, name, login, role FROM users ORDER BY name COLLATE NOCASE').all(),
+    q('SELECT * FROM client_notes ORDER BY date DESC, id DESC').all(),
+    q('SELECT * FROM meetings ORDER BY date DESC').all(),
+    q("SELECT value FROM settings WHERE key = 'review_weekday'").get(),
+  ]);
+  const seen = new Set(seenRows.map((row) => `${row.item_id}|${row.due_date}`));
+  const items = itemRows.map((item) => ({
     ...item,
     level: alertLevel(item),
     days_left: item.due_date ? daysUntil(item.due_date) : null,
     seen: seen.has(`${item.id}|${item.due_date}`),
   }));
   return {
-    me,
-    today: today(),
-    users: q('SELECT id, name, login, role FROM users ORDER BY name COLLATE NOCASE').all(),
-    clients,
-    items,
-    notes: q('SELECT * FROM client_notes ORDER BY date DESC, id DESC').all(),
-    meetings: q('SELECT * FROM meetings ORDER BY date DESC').all(),
-    settings: { review_weekday: Number(q("SELECT value FROM settings WHERE key = 'review_weekday'").get().value) },
+    me, today: today(), users, clients, items, notes, meetings,
+    settings: { review_weekday: Number(weekday.value) },
   };
 }
 
-function itemFields(body, current = {}) {
+async function itemFields(body, current = {}) {
   const merged = { ...current, ...body };
   const kind = merged.kind === 'documento' ? 'documento' : 'atividade';
   const notifyDays = Number(merged.notify_days ?? 3);
   if (!Number.isInteger(notifyDays) || notifyDays < 0 || notifyDays > 90) {
     throw new HttpError(400, 'Antecedência do aviso inválida.');
   }
-  const clientId = find('clients', merged.client_id).id;
-  const ownerId = merged.owner_id ? find('users', merged.owner_id).id : null;
+  const clientId = (await find('clients', merged.client_id)).id;
+  const ownerId = merged.owner_id ? (await find('users', merged.owner_id)).id : null;
   const done = merged.done ? 1 : 0;
   return {
     client_id: clientId, kind, title: text(merged.title, 'título', { required: true, max: 200 }),
@@ -200,107 +215,118 @@ function route(method, pattern, handler, { auth = 'user' } = {}) {
   const regex = new RegExp(`^${pattern.replace(/:\w+/g, '([^/]+)')}$`);
   routes.push({ method, regex, handler, auth });
 }
+const hasUsers = async () => !!(await q('SELECT 1 AS ok FROM users LIMIT 1').get());
 
-route('GET', '/api/status', ({ req }) => ({
-  needsSetup: !q('SELECT 1 FROM users LIMIT 1').get(),
-  me: currentUser(req),
+route('GET', '/api/status', async ({ req }) => ({
+  needsSetup: !(await hasUsers()),
+  me: await currentUser(req),
 }), { auth: 'public' });
 
-route('POST', '/api/setup', ({ req, res, body }) => {
-  if (q('SELECT 1 FROM users LIMIT 1').get()) throw new HttpError(403, 'O sistema já foi configurado.');
-  const result = q("INSERT INTO users (name, login, password, role) VALUES (?, ?, ?, 'admin')").run(
+route('POST', '/api/setup', async ({ req, res, body }) => {
+  if (await hasUsers()) throw new HttpError(403, 'O sistema já foi configurado.');
+  const result = await q("INSERT INTO users (name, login, password, role) VALUES (?, ?, ?, 'admin')").run(
     text(body.name, 'nome', { required: true, max: 100 }),
     text(body.login, 'login', { required: true, max: 100 }),
     hashPassword(validPassword(body.password)),
   );
-  startSession(req, res, Number(result.lastInsertRowid));
+  await startSession(req, res, result.lastId);
   return { ok: true };
 }, { auth: 'public' });
 
-route('POST', '/api/login', ({ req, res, body }) => {
+route('POST', '/api/login', async ({ req, res, body }) => {
   const login = String(body.login ?? '').trim().toLowerCase();
   assertLoginAllowed(login);
-  const user = q('SELECT * FROM users WHERE login = ?').get(login);
+  const user = await q('SELECT * FROM users WHERE login = ?').get(login);
   if (!user || !checkPassword(String(body.password ?? ''), user.password)) {
     recordLoginFailure(login);
     throw new HttpError(401, 'Login ou senha incorretos.');
   }
   loginAttempts.delete(login);
-  startSession(req, res, user.id);
+  await startSession(req, res, user.id);
   return { ok: true };
 }, { auth: 'public' });
 
-route('POST', '/api/logout', ({ req, res }) => {
+route('POST', '/api/logout', async ({ req, res }) => {
   const token = parseCookies(req).sid;
-  if (token) q('DELETE FROM sessions WHERE token = ?').run(sha256(token));
+  if (token) await q('DELETE FROM sessions WHERE token = ?').run(sha256(token));
   res.setHeader('Set-Cookie', 'sid=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0');
   return { ok: true };
 });
 
 route('GET', '/api/bootstrap', ({ me }) => bootstrap(me));
 
-route('POST', '/api/clients', ({ body }) => {
+route('POST', '/api/clients', async ({ body }) => {
   const c = clientFields(body);
-  const result = q(`INSERT INTO clients (name, type, phone, email, notes, active, portal_token)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)`)
+  const result = await q(`INSERT INTO clients (name, type, phone, email, notes, active, portal_token)
+                          VALUES (?, ?, ?, ?, ?, ?, ?)`)
     .run(c.name, c.type, c.phone, c.email, c.notes, c.active, crypto.randomBytes(24).toString('hex'));
-  return { id: Number(result.lastInsertRowid) };
+  return { id: result.lastId };
 });
-route('PUT', '/api/clients/:id', ({ params, body }) => {
-  const current = find('clients', params[0]);
+route('PUT', '/api/clients/:id', async ({ params, body }) => {
+  const current = await find('clients', params[0]);
   const c = clientFields({ ...current, ...body, active: (body.active ?? !!current.active) });
-  q('UPDATE clients SET name=?, type=?, phone=?, email=?, notes=?, active=? WHERE id=?')
+  await q('UPDATE clients SET name=?, type=?, phone=?, email=?, notes=?, active=? WHERE id=?')
     .run(c.name, c.type, c.phone, c.email, c.notes, c.active, current.id);
   return { ok: true };
 });
-route('DELETE', '/api/clients/:id', ({ params }) => {
-  q('DELETE FROM clients WHERE id = ?').run(find('clients', params[0]).id);
+route('DELETE', '/api/clients/:id', async ({ params }) => {
+  const { id } = await find('clients', params[0]);
+  await db.batch([
+    { sql: 'DELETE FROM seen WHERE item_id IN (SELECT id FROM items WHERE client_id = ?)', args: [id] },
+    { sql: 'DELETE FROM items WHERE client_id = ?', args: [id] },
+    { sql: 'DELETE FROM client_notes WHERE client_id = ?', args: [id] },
+    { sql: 'DELETE FROM clients WHERE id = ?', args: [id] },
+  ], 'write');
   return { ok: true };
 });
-route('POST', '/api/clients/:id/new-link', ({ params }) => {
-  q('UPDATE clients SET portal_token = ? WHERE id = ?')
-    .run(crypto.randomBytes(24).toString('hex'), find('clients', params[0]).id);
+route('POST', '/api/clients/:id/new-link', async ({ params }) => {
+  const { id } = await find('clients', params[0]);
+  await q('UPDATE clients SET portal_token = ? WHERE id = ?').run(crypto.randomBytes(24).toString('hex'), id);
   return { ok: true };
 });
 
-route('POST', '/api/items', ({ body }) => {
-  const i = itemFields(body);
-  const result = q(`INSERT INTO items (client_id, kind, title, details, due_date, notify_days,
-                    owner_id, done, done_at, visible_to_client) VALUES (?,?,?,?,?,?,?,?,?,?)`)
+route('POST', '/api/items', async ({ body }) => {
+  const i = await itemFields(body);
+  const result = await q(`INSERT INTO items (client_id, kind, title, details, due_date, notify_days,
+                          owner_id, done, done_at, visible_to_client) VALUES (?,?,?,?,?,?,?,?,?,?)`)
     .run(i.client_id, i.kind, i.title, i.details, i.due_date, i.notify_days,
       i.owner_id, i.done, i.done_at, i.visible_to_client);
-  return { id: Number(result.lastInsertRowid) };
+  return { id: result.lastId };
 });
-route('PUT', '/api/items/:id', ({ params, body }) => {
-  const current = find('items', params[0]);
-  const i = itemFields(body, current);
-  q(`UPDATE items SET client_id=?, kind=?, title=?, details=?, due_date=?, notify_days=?,
-     owner_id=?, done=?, done_at=?, visible_to_client=? WHERE id=?`)
+route('PUT', '/api/items/:id', async ({ params, body }) => {
+  const current = await find('items', params[0]);
+  const i = await itemFields(body, current);
+  await q(`UPDATE items SET client_id=?, kind=?, title=?, details=?, due_date=?, notify_days=?,
+           owner_id=?, done=?, done_at=?, visible_to_client=? WHERE id=?`)
     .run(i.client_id, i.kind, i.title, i.details, i.due_date, i.notify_days,
       i.owner_id, i.done, i.done_at, i.visible_to_client, current.id);
   return { ok: true };
 });
-route('DELETE', '/api/items/:id', ({ params }) => {
-  q('DELETE FROM items WHERE id = ?').run(find('items', params[0]).id);
+route('DELETE', '/api/items/:id', async ({ params }) => {
+  const { id } = await find('items', params[0]);
+  await db.batch([
+    { sql: 'DELETE FROM seen WHERE item_id = ?', args: [id] },
+    { sql: 'DELETE FROM items WHERE id = ?', args: [id] },
+  ], 'write');
   return { ok: true };
 });
-route('POST', '/api/items/:id/seen', ({ me, params }) => {
-  const item = find('items', params[0]);
+route('POST', '/api/items/:id/seen', async ({ me, params }) => {
+  const item = await find('items', params[0]);
   if (item.due_date) {
-    q('INSERT OR IGNORE INTO seen (user_id, item_id, due_date) VALUES (?, ?, ?)').run(me.id, item.id, item.due_date);
+    await q('INSERT OR IGNORE INTO seen (user_id, item_id, due_date) VALUES (?, ?, ?)').run(me.id, item.id, item.due_date);
   }
   return { ok: true };
 });
 
-route('POST', '/api/meetings', ({ body }) => {
+route('POST', '/api/meetings', async ({ body }) => {
   const date = dateOrNull(body.date) || today();
-  q('INSERT OR IGNORE INTO meetings (date) VALUES (?)').run(date);
-  q('UPDATE meetings SET closed = 0 WHERE date = ?').run(date);
+  await q('INSERT OR IGNORE INTO meetings (date) VALUES (?)').run(date);
+  await q('UPDATE meetings SET closed = 0 WHERE date = ?').run(date);
   return q('SELECT * FROM meetings WHERE date = ?').get(date);
 });
-route('PUT', '/api/meetings/:id', ({ params, body }) => {
-  const current = find('meetings', params[0]);
-  q('UPDATE meetings SET summary=?, next_date=?, closed=? WHERE id=?').run(
+route('PUT', '/api/meetings/:id', async ({ params, body }) => {
+  const current = await find('meetings', params[0]);
+  await q('UPDATE meetings SET summary=?, next_date=?, closed=? WHERE id=?').run(
     text(body.summary ?? current.summary, 'resumo', { max: 10000 }),
     dateOrNull(body.next_date !== undefined ? body.next_date : current.next_date),
     (body.closed ?? current.closed) ? 1 : 0,
@@ -308,48 +334,53 @@ route('PUT', '/api/meetings/:id', ({ params, body }) => {
   );
   return { ok: true };
 });
-route('POST', '/api/notes', ({ me, body }) => {
-  const clientId = find('clients', body.client_id).id;
-  const meetingId = body.meeting_id ? find('meetings', body.meeting_id).id : null;
-  q('INSERT INTO client_notes (client_id, meeting_id, author, text, date) VALUES (?,?,?,?,?)')
+route('POST', '/api/notes', async ({ me, body }) => {
+  const clientId = (await find('clients', body.client_id)).id;
+  const meetingId = body.meeting_id ? (await find('meetings', body.meeting_id)).id : null;
+  await q('INSERT INTO client_notes (client_id, meeting_id, author, text, date) VALUES (?,?,?,?,?)')
     .run(clientId, meetingId, me.name, text(body.text, 'anotação', { required: true, max: 5000 }), today());
   return { ok: true };
 });
 
-route('POST', '/api/users', ({ body }) => {
+route('POST', '/api/users', async ({ body }) => {
   const login = text(body.login, 'login', { required: true, max: 100 });
-  if (q('SELECT 1 FROM users WHERE login = ?').get(login)) throw new HttpError(409, 'Esse login já existe.');
-  const result = q('INSERT INTO users (name, login, password, role) VALUES (?, ?, ?, ?)').run(
+  if (await q('SELECT 1 AS ok FROM users WHERE login = ?').get(login)) throw new HttpError(409, 'Esse login já existe.');
+  const result = await q('INSERT INTO users (name, login, password, role) VALUES (?, ?, ?, ?)').run(
     text(body.name, 'nome', { required: true, max: 100 }), login,
     hashPassword(validPassword(body.password)), body.role === 'admin' ? 'admin' : 'membro',
   );
-  return { id: Number(result.lastInsertRowid) };
+  return { id: result.lastId };
 }, { auth: 'admin' });
-route('PUT', '/api/users/:id/password', ({ params, body }) => {
-  const user = find('users', params[0]);
-  q('UPDATE users SET password = ? WHERE id = ?').run(hashPassword(validPassword(body.password)), user.id);
-  q('DELETE FROM sessions WHERE user_id = ?').run(user.id);
+route('PUT', '/api/users/:id/password', async ({ params, body }) => {
+  const user = await find('users', params[0]);
+  await q('UPDATE users SET password = ? WHERE id = ?').run(hashPassword(validPassword(body.password)), user.id);
+  await q('DELETE FROM sessions WHERE user_id = ?').run(user.id);
   return { ok: true };
 }, { auth: 'admin' });
-route('DELETE', '/api/users/:id', ({ me, params }) => {
-  const user = find('users', params[0]);
+route('DELETE', '/api/users/:id', async ({ me, params }) => {
+  const user = await find('users', params[0]);
   if (user.id === me.id) throw new HttpError(400, 'Você não pode remover o próprio usuário.');
-  q('DELETE FROM users WHERE id = ?').run(user.id);
+  await db.batch([
+    { sql: 'UPDATE items SET owner_id = NULL WHERE owner_id = ?', args: [user.id] },
+    { sql: 'DELETE FROM seen WHERE user_id = ?', args: [user.id] },
+    { sql: 'DELETE FROM sessions WHERE user_id = ?', args: [user.id] },
+    { sql: 'DELETE FROM users WHERE id = ?', args: [user.id] },
+  ], 'write');
   return { ok: true };
 }, { auth: 'admin' });
-route('PUT', '/api/settings', ({ body }) => {
+route('PUT', '/api/settings', async ({ body }) => {
   const weekday = Number(body.review_weekday);
   if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6) throw new HttpError(400, 'Dia inválido.');
-  q("UPDATE settings SET value = ? WHERE key = 'review_weekday'").run(String(weekday));
+  await q("UPDATE settings SET value = ? WHERE key = 'review_weekday'").run(String(weekday));
   return { ok: true };
 }, { auth: 'admin' });
 
-route('GET', '/api/portal/:token', ({ params }) => {
-  const client = q('SELECT id, name, type FROM clients WHERE portal_token = ? AND active = 1').get(params[0]);
+route('GET', '/api/portal/:token', async ({ params }) => {
+  const client = await q('SELECT id, name, type FROM clients WHERE portal_token = ? AND active = 1').get(params[0]);
   if (!client) throw new HttpError(404, 'Link inválido ou desativado.');
-  const visible = q(`SELECT kind, title, details, due_date, notify_days, done, done_at FROM items
-                     WHERE client_id = ? AND visible_to_client = 1
-                     ORDER BY done, due_date IS NULL, due_date`).all(client.id);
+  const visible = await q(`SELECT kind, title, details, due_date, notify_days, done, done_at FROM items
+                           WHERE client_id = ? AND visible_to_client = 1
+                           ORDER BY done, due_date IS NULL, due_date`).all(client.id);
   const pending = visible.filter((item) => !item.done).map(({ done, done_at, notify_days, ...item }) => ({
     ...item, level: alertLevel({ due_date: item.due_date, done: 0, notify_days }),
   }));
@@ -415,7 +446,7 @@ async function handle(req, res) {
     if (req.method !== 'GET' && !(req.headers['content-type'] || '').startsWith('application/json')) {
       throw new HttpError(415, 'Formato não aceito.');
     }
-    const me = currentUser(req);
+    const me = await currentUser(req);
     if (r.auth !== 'public' && !me) throw new HttpError(401, 'Entre novamente.');
     if (r.auth === 'admin' && me.role !== 'admin') throw new HttpError(403, 'Apenas administradores.');
     const body = req.method === 'GET' ? {} : await readBody(req);
@@ -424,11 +455,19 @@ async function handle(req, res) {
   throw new HttpError(404, 'Rota não encontrada.');
 }
 
-http.createServer((req, res) => {
-  handle(req, res).catch((error) => {
-    if (!(error instanceof HttpError)) console.error(error);
-    if (!res.headersSent) {
-      sendJson(res, error.status || 500, { error: error instanceof HttpError ? error.message : 'Erro interno.' });
-    } else res.end();
-  });
-}).listen(PORT, () => console.log(`Aplicativo em http://localhost:${PORT}`));
+async function main() {
+  await db.executeMultiple(SCHEMA);
+  http.createServer((req, res) => {
+    handle(req, res).catch((error) => {
+      if (!(error instanceof HttpError)) console.error(error);
+      if (!res.headersSent) {
+        sendJson(res, error.status || 500, { error: error instanceof HttpError ? error.message : 'Erro interno.' });
+      } else res.end();
+    });
+  }).listen(PORT, () => console.log(`Aplicativo em http://localhost:${PORT}`));
+}
+
+main().catch((error) => {
+  console.error('Não foi possível iniciar:', error);
+  process.exit(1);
+});

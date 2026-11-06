@@ -5,9 +5,12 @@
   "description": "Gestão de atividades, prazos e documentos do escritório",
   "main": "server.js",
   "scripts": {
-    "start": "node --disable-warning=ExperimentalWarning server.js"
+    "start": "node server.js"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@libsql/client": "^0.18.0"
   }
 }

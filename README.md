@@ -4,25 +4,33 @@ Controle de clientes, atividades, prazos e documentos faltando, com avisos dentr
 
 ## Rodar no computador
 
-Precisa do Node.js 22.13 ou mais novo. Não há dependências para instalar.
+Precisa do Node.js 22 ou mais novo.
+
+```bash
+npm install
+```
 
 ```bash
 npm start
 ```
 
-Abra http://localhost:3000. No primeiro acesso, crie o usuário administrador.
+Abra http://localhost:3000. No primeiro acesso, crie o usuário administrador. Sem configuração, os dados ficam em um arquivo na pasta `data`.
 
-## Publicar online
+## Publicar online de graça
 
-O aplicativo precisa de um serviço que rode Node.js e tenha disco permanente, porque os dados ficam em um arquivo SQLite. Render e Railway são duas opções, e o disco permanente normalmente é pago.
+O aplicativo roda no plano grátis da Render, e os dados ficam em um banco no plano grátis do Turso.
 
-1. Coloque esta pasta em um repositório no GitHub.
-2. Crie o serviço apontando para o repositório, com o comando de início `npm start`.
-3. Crie um disco permanente, por exemplo em `/data`.
-4. Defina a variável `DATA_DIR` com esse caminho.
-5. Abra o endereço gerado e crie o administrador imediatamente, porque o primeiro acesso fica aberto até isso ser feito.
+1. Crie um banco no Turso e gere um token de acesso.
+2. Crie o serviço na Render a partir do repositório. O arquivo `render.yaml` já traz a configuração.
+3. Preencha `DATABASE_URL` com o endereço do banco e `DATABASE_TOKEN` com o token.
+4. Abra o endereço gerado e crie o administrador imediatamente, porque o primeiro acesso fica aberto até isso ser feito.
 
-Sem o disco permanente, os dados são apagados a cada atualização do serviço. Faça cópias de segurança da pasta de dados.
+Limites do plano grátis da Render:
+
+- O serviço dorme depois de 15 minutos sem acesso e leva cerca de um minuto para acordar.
+- Sem atualização automática por repositório conectado, cada nova versão precisa ser publicada manualmente.
+
+Nunca coloque o token no repositório, porque ele é público. Faça cópias de segurança dos dados periodicamente.
 
 ## Instalar no celular
 
